@@ -6,6 +6,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -36,26 +38,32 @@ const (
 type DevicePlugin struct {
 	pluginapi.UnimplementedDevicePluginServer
 
-	ctx     context.Context
-	// devices represent the currently discovered tenstorrent devices
-	devices []*pluginapi.Device
+	ctx context.Context
+	// devicesMu guards all access to the devices map.
+	devicesMu sync.RWMutex
+	// devices is the canonical store of discovered tenstorrent devices, keyed by device ID.
+	// All reads (ListAndWatch, Allocate) take a read lock; all writes (health checker) take a write lock.
+	devices map[string]*pluginapi.Device
 	// resourceName represents the card(s) discovered, eg: n150 or n300
 	resourceName string
 	// socket represents the device plugin socket the kubelet will communicate with
-	socket  string
+	socket string
 	// socketDir is the directory where sockets are created (default: /var/lib/kubelet/device-plugins)
-	socketDir  string
+	socketDir string
 }
 
-// NewDevicePlugin should enumerate a hosts' tenstorrent devices
-// TODO: Remove this stub
 func NewDevicePlugin(resourceName string, devices []*pluginapi.Device) *DevicePlugin {
+	store := make(map[string]*pluginapi.Device, len(devices))
+	for _, d := range devices {
+		store[d.ID] = d
+	}
+
 	return &DevicePlugin{
-		ctx: context.Background(),
-		devices: devices,
+		ctx:          context.Background(),
+		devices:      store,
 		resourceName: resourceName,
-		socket: socketName,
-		socketDir: pluginapi.DevicePluginPath,
+		socket:       socketName,
+		socketDir:    pluginapi.DevicePluginPath,
 	}
 }
 
@@ -70,12 +78,29 @@ func (dp *DevicePlugin) GetDevicePluginOptions(context.Context, *pluginapi.Empty
 // returns the new list
 func (dp *DevicePlugin) ListAndWatch(e *pluginapi.Empty, stream pluginapi.DevicePlugin_ListAndWatchServer) error {
 	for {
-		klog.Info("ListAndWatch: sending device list")
-		if err := stream.Send(&pluginapi.ListAndWatchResponse{Devices: dp.devices}); err != nil {
+		snapshot := dp.deviceSnapshot()
+
+		klog.Infof("ListAndWatch: sending %d device(s)", len(snapshot))
+		if err := stream.Send(&pluginapi.ListAndWatchResponse{Devices: snapshot}); err != nil {
 			return err
 		}
 		time.Sleep(5 * time.Second)
 	}
+}
+
+// deviceSnapshot returns a point-in-time copy of every device in the store.
+// The returned slice is safe to pass to gRPC; it will not be mutated by the
+// health checker or any other writer.
+func (dp *DevicePlugin) deviceSnapshot() []*pluginapi.Device {
+	dp.devicesMu.RLock()
+	defer dp.devicesMu.RUnlock()
+
+	out := make([]*pluginapi.Device, 0, len(dp.devices))
+	for _, d := range dp.devices {
+		copy := *d
+		out = append(out, &copy)
+	}
+	return out
 }
 
 // GetPreferredAllocation returns a preferred set of devices to allocate
@@ -89,25 +114,53 @@ func (dp *DevicePlugin) GetPreferredAllocation(context.Context, *pluginapi.Prefe
 
 // Allocate is called during container creation so that the Device
 // Plugin can run device specific operations and instruct Kubelet
-// of the steps to make the Device available in the container
+// of the steps to make the Device available in the container.
+//
+// For each container request kubelet sends us the device IDs it has already
+// reserved. We validate every ID against the store (must exist and be Healthy),
+// mount only the specific /dev/tenstorrent/<id> nodes, and set TT_VISIBLE_DEVICES
+// to the comma-separated list of IDs for that container.
 func (dp *DevicePlugin) Allocate(ctx context.Context, req *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
-	devs := []*pluginapi.DeviceSpec{
-		{
-			HostPath:      "/dev/tenstorrent",
-			ContainerPath: "/dev/tenstorrent",
-			Permissions:   "rw",
-		},
+	if len(req.ContainerRequests) == 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "Allocate called with empty ContainerRequests")
 	}
 
+	dp.devicesMu.RLock()
+	defer dp.devicesMu.RUnlock()
+
 	resp := &pluginapi.AllocateResponse{
-		ContainerResponses: []*pluginapi.ContainerAllocateResponse{
-			{
-				Envs: map[string]string{
-					"TT_VISIBLE_DEVICES": req.ContainerRequests[0].DevicesIds[0],
-				},
-				Devices: devs,
+		ContainerResponses: make([]*pluginapi.ContainerAllocateResponse, 0, len(req.ContainerRequests)),
+	}
+
+	for i, cr := range req.ContainerRequests {
+		if len(cr.DevicesIds) == 0 {
+			return nil, status.Errorf(codes.InvalidArgument, "ContainerRequests[%d] has empty DevicesIds", i)
+		}
+
+		devSpecs := make([]*pluginapi.DeviceSpec, 0, len(cr.DevicesIds))
+		for _, id := range cr.DevicesIds {
+			dev, ok := dp.devices[id]
+			if !ok {
+				return nil, status.Errorf(codes.NotFound, "unknown device %q", id)
+			}
+			if dev.Health != pluginapi.Healthy {
+				return nil, status.Errorf(codes.FailedPrecondition, "device %q is %s", id, dev.Health)
+			}
+
+			devPath := fmt.Sprintf("/dev/tenstorrent/%s", id)
+			devSpecs = append(devSpecs, &pluginapi.DeviceSpec{
+				HostPath:      devPath,
+				ContainerPath: devPath,
+				Permissions:   "rw",
+			})
+		}
+
+		resp.ContainerResponses = append(resp.ContainerResponses, &pluginapi.ContainerAllocateResponse{
+			Envs: map[string]string{
+				"TT_VISIBLE_DEVICES": strings.Join(cr.DevicesIds, ","),
 			},
-		},
+			Devices: devSpecs,
+		})
 	}
 
 	return resp, nil
@@ -120,8 +173,44 @@ func (dp *DevicePlugin) PreStartContainer(context.Context, *pluginapi.PreStartCo
 	return &pluginapi.PreStartContainerResponse{}, nil
 }
 
+// checkDeviceHealth performs a non-disruptive health probe for a single device
+// by verifying its sysfs entry still exists. Heavier diagnostics (e.g. tt-smi)
+// are intentionally omitted here because they disrupt running workloads.
+//
+// Health-check contract (ROADMAP 3.1):
+//
+//	path: /sys/class/tenstorrent/tenstorrent!<device_id>/tt_card_type
+//	present  → Healthy
+//	absent   → Unhealthy
+func checkDeviceHealth(deviceID string) string {
+	sysfsPath := fmt.Sprintf("/sys/class/tenstorrent/tenstorrent!%s/tt_card_type", deviceID)
+	if _, err := os.Stat(sysfsPath); err != nil {
+		return pluginapi.Unhealthy
+	}
+	return pluginapi.Healthy
+}
+
+// RunStartupHealthChecks evaluates every device in the store exactly once and
+// updates its Health field. This is intended to be called synchronously during
+// plugin startup, before the gRPC server begins serving, so there are no
+// concurrent readers and no risk of disrupting running workloads.
+//
+// Heavier or disruptive diagnostics (e.g. tt-smi) can safely be used here
+// because no pods have been scheduled yet.
+func (dp *DevicePlugin) RunStartupHealthChecks() {
+	dp.devicesMu.Lock()
+	defer dp.devicesMu.Unlock()
+
+	for id, dev := range dp.devices {
+		dev.Health = checkDeviceHealth(id)
+		klog.Infof("Startup health check: device %s → %s", id, dev.Health)
+	}
+}
+
 // Start initiates the gRPC server for the device plugin
 func (dp *DevicePlugin) Start() error {
+	dp.RunStartupHealthChecks()
+
 	fullSocketPath := filepath.Join(dp.socketDir, dp.socket)
   
   // Clean up

@@ -75,6 +75,7 @@ func discoverAndStartPlugins() {
 			continue
 		}
 		resourceName := strings.TrimSpace(string(cardType))
+		// FIXME: validate resourceName value ('unknown' means it isn't currently supported)
 		devices[resourceName] = append(devices[resourceName], &pluginapi.Device{
 			ID:     deviceID,
 			Health: pluginapi.Healthy,

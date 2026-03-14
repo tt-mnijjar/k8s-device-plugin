@@ -78,6 +78,42 @@ sequenceDiagram
   - [x] Register with kubelet via the Unix socket
 - [ ] Return something valid from `Allocate()` ()
 - [ ] Test E2E ([see Example](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#example-pod))
+- [ ] Enable better health check management. There is no direct pod/workload calls backs to know when the card is not mounted anymore. Usage would need to be inferred by the device-plugin from other sources.
+- [ ] **Refactor `internal/plugin` by concern:** Split `device_plugin.go` into `device_plugin.go` (struct + gRPC interface methods), `health.go` (checkDeviceHealth, RunStartupHealthChecks), and `server.go` (Start, Register, dial). Keeps the package small and isolates health and lifecycle logic; aligns with the pattern used in `internal/prerequisites/`.
+
+## Testing
+
+Running tests with local `go` install:
+`go test ./...`
+
+Running the tests within a docker container:
+`docker run --rm -v "$(pwd)":/src -w /src golang:1.25-bookworm go test ./...`
+
+
+### Testing in (Kind) Kubernetes
+```
+# 1) Build image
+docker build -t k8s-device-plugin:test .
+
+# 2) Create Kind cluster (uses kind.yaml)
+kind create cluster -f kind.yaml
+
+# 3) Load your image into Kind (so the DaemonSet can use it)
+kind load docker-image k8s-device-plugin:test
+
+# 4) Deploy the plugin (edit device-plugin-daemonset.yaml to use k8s-device-plugin:test)
+kubectl apply -f device-plugin-daemonset.yaml
+
+# 5) Check plugin and node allocatable
+kubectl get pods -n kube-system -l app=k8s-device-plugin
+kubectl get no kind-control-plane -o json | jq '.status.allocatable'
+
+# 6) Run example workload (pod requesting tenstorrent device)
+kubectl apply -f example-workload.yaml
+kubectl get pods
+kubectl describe pod <example-pod-name>
+```
+
 
 ## Reference
 
