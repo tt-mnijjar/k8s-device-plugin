@@ -1,0 +1,244 @@
+---
+description: Rules for working on the Kubernetes device plugin implementation (cmd/k8s-device-plugin and internal/plugin)
+globs: cmd/k8s-device-plugin/**,internal/plugin/**
+alwaysApply: false
+---
+
+# Kubernetes Device Plugin — Implementation Rules
+
+This project implements a Kubernetes Device Plugin for Tenstorrent hardware.
+The plugin advertises Tenstorrent accelerator devices to the kubelet so they
+can be scheduled to pods. All code under `cmd/k8s-device-plugin/` and
+`internal/plugin/` must follow these rules.
+
+---
+
+## DevicePluginServer gRPC Interface
+
+The `DevicePlugin` struct **must** embed `pluginapi.UnimplementedDevicePluginServer`
+and satisfy the `DevicePluginServer` interface from the
+`k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1` package (imported as `pluginapi`).
+
+The interface requires these five methods:
+
+```go
+type DevicePluginServer interface {
+    // GetDevicePluginOptions returns options to be communicated with Device Manager.
+    GetDevicePluginOptions(context.Context, *Empty) (*DevicePluginOptions, error)
+
+    // ListAndWatch returns a stream of List of Devices.
+    // Whenever a Device state changes or a Device disappears, ListAndWatch
+    // returns the new list.
+    ListAndWatch(*Empty, grpc.ServerStreamingServer[ListAndWatchResponse]) error
+
+    // GetPreferredAllocation returns a preferred set of devices to allocate
+    // from a list of available ones. The resulting preferred allocation is not
+    // guaranteed to be the allocation ultimately performed by the device manager.
+    // It is only designed to help the device manager make a more informed
+    // allocation decision when possible.
+    GetPreferredAllocation(context.Context, *PreferredAllocationRequest) (*PreferredAllocationResponse, error)
+
+    // Allocate is called during container creation so that the Device Plugin
+    // can run device-specific operations and instruct Kubelet of the steps
+    // to make the Device available in the container.
+    Allocate(context.Context, *AllocateRequest) (*AllocateResponse, error)
+
+    // PreStartContainer is called, if indicated by Device Plugin during the
+    // registration phase, before each container start. Device plugin can run
+    // device-specific operations such as resetting the device before making
+    // devices available to the container.
+    PreStartContainer(context.Context, *PreStartContainerRequest) (*PreStartContainerResponse, error)
+
+    mustEmbedUnimplementedDevicePluginServer()
+}
+```
+
+### Method implementation guidance
+
+- **GetDevicePluginOptions** — Return flags that tell kubelet which optional
+  features this plugin supports. If `GetPreferredAllocation` or
+  `PreStartContainer` are not meaningfully implemented, their corresponding
+  flags in `DevicePluginOptions` must be `false`. Kubelet always calls
+  `GetDevicePluginOptions` first to discover available optional calls.
+- **ListAndWatch** — This is the primary health-reporting channel. It must
+  send the full device list whenever device state changes (healthy → unhealthy
+  or vice-versa, device added/removed). Use `pluginapi.Healthy` and
+  `pluginapi.Unhealthy` constants for the `Health` field on each `Device`.
+  The stream must remain open for the lifetime of the plugin.
+- **GetPreferredAllocation** — Optional. Return `codes.Unimplemented` if the
+  plugin has no allocation preference. When implemented, return the subset of
+  device IDs from the request that are preferred for co-allocation.
+- **Allocate** — Called once per container that requests this resource.
+  The `AllocateRequest` contains a `ContainerRequests` slice — one entry per
+  container. Each entry has `DevicesIds`. For each container request, return
+  a `ContainerAllocateResponse` specifying any combination of:
+  - `Devices` (`[]*DeviceSpec`) — host device nodes to mount into the container
+    (`HostPath`, `ContainerPath`, `Permissions` where permissions are `r`, `w`,
+    `m` or combinations).
+  - `Envs` (`map[string]string`) — environment variables injected into the
+    container.
+  - `Mounts` (`[]*Mount`) — host paths to bind-mount (`HostPath`, `ContainerPath`,
+    `ReadOnly`).
+  - `Annotations` (`map[string]string`) — annotations set on the container.
+- **PreStartContainer** — Optional. Return an empty response if the plugin
+  does not need to perform operations before container start.
+
+---
+
+## Plugin Lifecycle & Operational Flow
+
+A device plugin follows a strict three-phase lifecycle. The ordering is
+critical — deviating from it will cause registration failures.
+
+### Phase 1 — Initialization & Device Discovery
+
+1. The plugin process starts and discovers hardware on the host (e.g. by
+   scanning `/dev/tenstorrent/*` device nodes and reading card type information
+   from sysfs at `/sys/class/tenstorrent/`).
+2. For each unique card type (resource name), build a list of
+   `pluginapi.Device` structs with a unique `ID` and initial `Health` status.
+
+### Phase 2 — Start gRPC Server (BEFORE Registration)
+
+1. Create a Unix socket under `/var/lib/kubelet/device-plugins/` (the
+   `pluginapi.DevicePluginPath` constant). Remove any stale socket file first.
+2. Start a gRPC server on that socket and register the `DevicePluginServer`
+   implementation with it.
+3. The gRPC server **must** be serving before proceeding to registration.
+   Kubelet will immediately call back on this socket after registration
+   succeeds. If the server is not ready, registration effectively fails.
+
+### Phase 3 — Register with Kubelet
+
+1. Dial the kubelet registration socket at
+   `/var/lib/kubelet/device-plugins/kubelet.sock` (the `pluginapi.KubeletSocket`
+   constant) using a gRPC client connection.
+2. Call `Registration.Register` with a `RegisterRequest` containing:
+   - `Version`: must be `pluginapi.Version` (the device plugin API version).
+   - `Endpoint`: the **filename only** (not the full path) of the Unix socket
+     created in Phase 2.
+   - `ResourceName`: a fully qualified extended resource name in the form
+     `<vendor-domain>/<resource-type>` (e.g. `tenstorrent.com/n150`).
+     The vendor domain must be a DNS subdomain. The resource type must not
+     start with `kubernetes.io/`.
+3. If registration fails, the plugin should terminate or retry. Registration
+   failure can occur when:
+   - The API version is not supported by the kubelet.
+   - The `ResourceName` is already claimed by another active plugin.
+
+### Post-Registration — Serving Mode
+
+After successful registration, kubelet will:
+
+1. Call `GetDevicePluginOptions` to discover supported optional features.
+2. Call `ListAndWatch` and hold the stream open. The plugin must immediately
+   send the initial device list and then send updates whenever state changes.
+3. Call `Allocate` when a pod is scheduled that requests this resource.
+4. Optionally call `PreStartContainer` before each container start if the
+   plugin indicated support via `DevicePluginOptions`.
+
+---
+
+## Failure Recovery & Resilience
+
+### Kubelet restart
+
+- When kubelet restarts it deletes all existing Unix sockets under
+  `/var/lib/kubelet/device-plugins/`.
+- The plugin must detect this (e.g. by monitoring the socket file with an
+  `fsnotify` watcher or by detecting the gRPC stream breaking) and
+  re-register with the new kubelet instance. This means repeating Phase 2
+  and Phase 3.
+
+### Device failure
+
+- When a device becomes unhealthy, update its `Health` field to
+  `pluginapi.Unhealthy` and send the full updated device list via the
+  `ListAndWatch` stream.
+- Kubelet will decrease the allocatable count for the resource but will not
+  evict existing pods using the device.
+
+### Plugin failure
+
+- If the plugin crashes, kubelet removes the resource from node capacity.
+- Pods already running with allocated devices are **not** terminated.
+- New pods requesting the resource cannot be scheduled until the plugin
+  re-registers.
+
+---
+
+## Resource Naming Convention
+
+Resources are advertised as Kubernetes extended resources:
+
+- Format: `<vendor-domain>/<resource-type>`
+- This project uses `tenstorrent.com` as the vendor domain.
+- The resource type should match the card type discovered at runtime
+  (e.g. `n150`, `n300`).
+- The full resource name (e.g. `tenstorrent.com/n150`) is what users specify
+  in pod specs under `resources.limits`.
+
+Example pod spec requesting one device:
+
+```yaml
+resources:
+  limits:
+    tenstorrent.com/n150: 1
+```
+
+Extended resources:
+- Are always integers (no fractional requests).
+- Cannot be overcommitted (limits must equal requests).
+- Cannot be shared between containers.
+
+---
+
+## Socket & Path Constants
+
+Always use the constants from `pluginapi` rather than hard-coding paths:
+
+| Constant                     | Value                                         | Usage                          |
+|------------------------------|-----------------------------------------------|--------------------------------|
+| `pluginapi.DevicePluginPath` | `/var/lib/kubelet/device-plugins/`             | Directory for plugin sockets   |
+| `pluginapi.KubeletSocket`    | `/var/lib/kubelet/device-plugins/kubelet.sock` | Kubelet registration endpoint  |
+| `pluginapi.Version`          | `v1beta1`                                      | API version for registration   |
+
+---
+
+## AllocateResponse Structure
+
+Each `ContainerAllocateResponse` can specify the following to configure
+how the container accesses the device:
+
+```go
+type ContainerAllocateResponse struct {
+    Envs        map[string]string   // Environment variables
+    Mounts      []*Mount            // Bind mounts from host to container
+    Devices     []*DeviceSpec       // Device nodes to expose
+    Annotations map[string]string   // Container annotations
+}
+
+type DeviceSpec struct {
+    ContainerPath string  // Path inside the container (e.g. /dev/tenstorrent)
+    HostPath      string  // Path on the host (e.g. /dev/tenstorrent)
+    Permissions   string  // "r", "w", "m", or combinations like "rw"
+}
+
+type Mount struct {
+    ContainerPath string  // Mount point inside the container
+    HostPath      string  // Path on the host
+    ReadOnly      bool
+}
+```
+
+---
+
+## Code Style for This Package
+
+- Use `klog/v2` for all logging.
+- Import the device plugin API as: `pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"`
+- Use `google.golang.org/grpc` for gRPC server and client operations.
+- gRPC dial operations should use `grpc.WithTransportCredentials(insecure.NewCredentials())`
+  since kubelet communication is over local Unix sockets.
+- Always clean up stale socket files before creating new listeners.
+- Context timeouts should be used for registration dial attempts.
