@@ -53,6 +53,7 @@ func NewDevicePlugin(resourceName string, devices []*pluginapi.Device) *DevicePl
 	return &DevicePlugin{
 		ctx: context.Background(),
 		devices: devices,
+		resourceName: resourceName,
 		socket: socketName,
 		socketDir: pluginapi.DevicePluginPath,
 	}

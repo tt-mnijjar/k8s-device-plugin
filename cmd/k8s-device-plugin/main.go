@@ -10,17 +10,44 @@ import (
 	"syscall"
 
 	"github.com/goshlanguage/k8s-device-plugin/internal/plugin"
+	"github.com/goshlanguage/k8s-device-plugin/internal/prerequisites"
 	"k8s.io/klog/v2"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
 func main() {
+	runPrerequisitesChecks()
 	discoverAndStartPlugins()
 
-	// Block until a signal is received.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
+}
+
+func runPrerequisitesChecks() {
+	checks := []prerequisites.Check{
+		prerequisites.NewDirectoryCheck(
+			"tt-kmd-device-nodes",
+			"/dev/tenstorrent",
+			prerequisites.Required,
+		),
+		prerequisites.NewDirectoryCheck(
+			"tt-kmd-sysfs",
+			"/sys/class/tenstorrent",
+			prerequisites.Required,
+		),
+		prerequisites.NewSocketCheck(
+			"kubelet-device-plugin-socket",
+			pluginapi.KubeletSocket,
+			prerequisites.Required,
+		),
+		// Add future health-check tool requirements here, e.g.:
+		// prerequisites.NewBinaryCheck("tt-smi", prerequisites.Required),
+	}
+
+	if err := prerequisites.RunAll(checks); err != nil {
+		klog.Fatalf("Prerequisite checks failed: %v", err)
+	}
 }
 
 // discoverAndStartPlugins iterates through the devie nodes to discover installed cards
