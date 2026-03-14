@@ -20,10 +20,7 @@ import (
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
-const (
-	resourceDomain = "tenstorrent.com"
-	socketName     = "tenstorrent.sock"
-)
+const resourceDomain = "tenstorrent.com"
 
 // DevicePlugin should conform to the DevicePluginServer Interface as seen here:
 //
@@ -62,7 +59,7 @@ func NewDevicePlugin(resourceName string, devices []*pluginapi.Device) *DevicePl
 		ctx:          context.Background(),
 		devices:      store,
 		resourceName: resourceName,
-		socket:       socketName,
+		socket:       fmt.Sprintf("tenstorrent-%s.sock", resourceName),
 		socketDir:    pluginapi.DevicePluginPath,
 	}
 }
@@ -255,7 +252,7 @@ func (dp *DevicePlugin) Register(kubeletEndpoint string) error {
 	req := &pluginapi.RegisterRequest{
 		Version:      pluginapi.Version,
 		Endpoint:     dp.socket,
-		ResourceName: fmt.Sprintf("%s/n150", resourceDomain),
+		ResourceName: fmt.Sprintf("%s/%s", resourceDomain, dp.resourceName),
 	}
 
 	klog.Infof("Registering with kubelet on endpoint %s", req.Endpoint)
