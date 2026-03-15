@@ -204,8 +204,19 @@ func (dp *DevicePlugin) RunStartupHealthChecks() {
 	}
 }
 
-// Start initiates the gRPC server for the device plugin
+// Start initiates the gRPC server for the device plugin.
+// If the device store is empty (no devices were discovered for this resource),
+// Start logs and returns nil without creating a socket or registering with kubelet.
 func (dp *DevicePlugin) Start() error {
+	dp.devicesMu.RLock()
+	empty := len(dp.devices) == 0
+	dp.devicesMu.RUnlock()
+
+	if empty {
+		klog.Infof("No devices for resource %q; skipping plugin registration", dp.resourceName)
+		return nil
+	}
+
 	dp.RunStartupHealthChecks()
 
 	fullSocketPath := filepath.Join(dp.socketDir, dp.socket)

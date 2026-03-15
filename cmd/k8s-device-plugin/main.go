@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,15 +25,18 @@ func main() {
 
 func runPrerequisitesChecks() {
 	checks := []prerequisites.Check{
+		// Downgraded to Warning: nodes without Tenstorrent cards will not have
+		// these paths, and the DaemonSet runs on every node. Missing paths mean
+		// no devices will be discovered; the plugin will idle rather than crash.
 		prerequisites.NewDirectoryCheck(
 			"tt-kmd-device-nodes",
 			"/dev/tenstorrent",
-			prerequisites.Required,
+			prerequisites.Warning,
 		),
 		prerequisites.NewDirectoryCheck(
 			"tt-kmd-sysfs",
 			"/sys/class/tenstorrent",
-			prerequisites.Required,
+			prerequisites.Warning,
 		),
 		prerequisites.NewSocketCheck(
 			"kubelet-device-plugin-socket",
@@ -50,8 +52,10 @@ func runPrerequisitesChecks() {
 	}
 }
 
-// discoverAndStartPlugins iterates through the devie nodes to discover installed cards
-//     the driver is expected to expose tt_card_type for discovering the resource name
+// discoverAndStartPlugins iterates through the device nodes to discover installed cards.
+// The driver is expected to expose tt_card_type for discovering the resource name.
+// If /dev/tenstorrent does not exist or is empty (e.g. node has no Tenstorrent cards),
+// this function logs and returns without starting any plugin.
 func discoverAndStartPlugins() {
 	devices := make(map[string][]*pluginapi.Device)
 
@@ -60,21 +64,17 @@ func discoverAndStartPlugins() {
 		klog.Fatalf("Could not glob /dev/tenstorrent: %v", err)
 	}
 
-	for _, file := range files {
-		deviceID := filepath.Base(file)
+	for _, devPath := range files {
+		deviceID := filepath.Base(devPath)
 		cardTypePath := fmt.Sprintf("/sys/class/tenstorrent/tenstorrent!%s/tt_card_type", deviceID)
 
-		file, err := os.Open(cardTypePath)
-		if err !=nil {
-			klog.Errorf("Failed to read card information from: %s. %s", cardTypePath, err.Error())
-		}
-
-		cardType, err := io.ReadAll(file)
+		cardTypeBytes, err := os.ReadFile(cardTypePath)
 		if err != nil {
-			klog.Warningf("Could not read card type from %s: %v", cardTypePath, err)
+			klog.Errorf("Failed to read card type from %s, skipping device %s: %v", cardTypePath, deviceID, err)
 			continue
 		}
-		resourceName := strings.TrimSpace(string(cardType))
+
+		resourceName := strings.TrimSpace(string(cardTypeBytes))
 		// FIXME: validate resourceName value ('unknown' means it isn't currently supported)
 		devices[resourceName] = append(devices[resourceName], &pluginapi.Device{
 			ID:     deviceID,
@@ -82,11 +82,16 @@ func discoverAndStartPlugins() {
 		})
 	}
 
-	klog.Infof("Discovered %v devices: %v", len(devices), devices)
+	if len(devices) == 0 {
+		klog.Info("No Tenstorrent devices discovered on this node; no device plugins will be started")
+		return
+	}
+
+	klog.Infof("Discovered %d resource type(s): %v", len(devices), devices)
 
 	for resourceName, devs := range devices {
 		dp := plugin.NewDevicePlugin(resourceName, devs)
-		
+
 		go func(dp *plugin.DevicePlugin) {
 			klog.Infof("Starting device plugin for resource %s", resourceName)
 
