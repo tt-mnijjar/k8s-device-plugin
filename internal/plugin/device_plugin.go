@@ -241,11 +241,41 @@ func (dp *DevicePlugin) Start() error {
 		}
 	}()
 
-	// dummy wait
-	//    hoping that the grpc server has acquired the lock in this time before kubelet calls back
-	time.Sleep(1 * time.Second)
+	if err := dp.waitForServerReady(5 * time.Second); err != nil {
+		return fmt.Errorf("gRPC server readiness check failed: %v", err)
+	}
 
 	return dp.Register(pluginapi.KubeletSocket)
+}
+
+// waitForServerReady dials back to the plugin's own gRPC socket and blocks
+// until the connection reaches connectivity.Ready, proving the server is
+// accepting RPCs. The test connection is closed before returning.
+func (dp *DevicePlugin) waitForServerReady(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	socketEndpoint := fmt.Sprintf("unix://%s", filepath.Join(dp.socketDir, dp.socket))
+	conn, err := grpc.NewClient(
+		socketEndpoint,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create gRPC client for readiness check: %v", err)
+	}
+	defer conn.Close()
+
+	conn.Connect()
+	for {
+		state := conn.GetState()
+		if state == connectivity.Ready {
+			klog.Infof("gRPC server confirmed ready on %s", socketEndpoint)
+			return nil
+		}
+		if !conn.WaitForStateChange(ctx, state) {
+			return fmt.Errorf("gRPC server not ready within %s, last state: %s", timeout, state)
+		}
+	}
 }
 
 func (dp *DevicePlugin) Register(kubeletEndpoint string) error {
