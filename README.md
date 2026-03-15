@@ -144,6 +144,23 @@ kubectl get pods
 kubectl describe pod <example-pod-name>
 ```
 
+### Testing with k3s on a single host (real Tenstorrent hardware)
+
+On an Ubuntu 22.04 host with Docker, Tenstorrent KMD, and cards installed, you can use the scripts in `scripts/` to bring up a single-node k3s cluster and deploy the device plugin, then tear it down when done.
+
+**Setup (install k3s, build plugin image, deploy DaemonSet, wait for ready):**
+```sh
+./scripts/k3s-dev-env.sh setup
+```
+The script logs each stage; on failure it reports which step failed. When it finishes, it prints the exact `kubectl apply -f ...` command to run a pod that requests a Tenstorrent device.
+
+**Teardown (remove DaemonSet and uninstall k3s):**
+```sh
+./scripts/k3s-dev-env.sh teardown
+```
+
+Optional: set `DEVICE_PLUGIN_IMAGE` to use a different image tag (default: `k8s-device-plugin:local`).
+
 
 ## Reference
 
