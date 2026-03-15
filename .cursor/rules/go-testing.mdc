@@ -11,6 +11,26 @@ dependency so tests are fast and reproducible in CI.
 
 ---
 
+## API-Only Testing Rule
+
+All tests must refer **only to the public API** (exported types and function/method
+signatures). Tests must NOT:
+
+- Depend on or assert against unexported symbols (e.g. unexported functions,
+  unexported struct fields, package-level variables).
+- Read or mutate unexported struct fields directly.
+- Rely on package-internal constants or file-level implementation details.
+
+Behavior is verified solely through:
+
+- **Unit tests:** Constructors, exported methods, and injected interfaces (mocks).
+  Assert only on return values, gRPC responses, or observable side effects via
+  the same public API.
+- **Integration tests:** gRPC client calls to the plugin server and assertions on
+  responses and streams.
+
+---
+
 ## Test File Conventions
 
 - Name test files `*_test.go` alongside the source file they cover.

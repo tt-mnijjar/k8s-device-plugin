@@ -1,5 +1,7 @@
 package plugin
 
+//go:generate mockgen -source=device_plugin.go -destination=mocks/mock_health_checker.go -package=mocks HealthChecker
+
 import (
 	"context"
 	"fmt"
@@ -21,6 +23,37 @@ import (
 )
 
 const resourceDomain = "tenstorrent.com"
+
+// HealthChecker abstracts per-device health probes so tests can inject a mock
+// without touching the filesystem or real hardware.
+type HealthChecker interface {
+	Check(deviceID string) string
+}
+
+// sysfsHealthChecker is the default HealthChecker. It verifies a device's
+// sysfs entry exists to determine health.
+type sysfsHealthChecker struct{}
+
+func (s *sysfsHealthChecker) Check(deviceID string) string {
+	return checkDeviceHealth(deviceID)
+}
+
+// Option configures a DevicePlugin. Pass options to NewDevicePlugin.
+type Option func(*DevicePlugin)
+
+// WithHealthChecker overrides the default sysfs-based health checker.
+func WithHealthChecker(hc HealthChecker) Option {
+	return func(dp *DevicePlugin) {
+		dp.healthChecker = hc
+	}
+}
+
+// WithSocketDir overrides the directory where the plugin socket is created.
+func WithSocketDir(dir string) Option {
+	return func(dp *DevicePlugin) {
+		dp.socketDir = dir
+	}
+}
 
 // DevicePlugin should conform to the DevicePluginServer Interface as seen here:
 //
@@ -47,21 +80,30 @@ type DevicePlugin struct {
 	socket string
 	// socketDir is the directory where sockets are created (default: /var/lib/kubelet/device-plugins)
 	socketDir string
+	// healthChecker performs per-device health probes; defaults to sysfsHealthChecker.
+	healthChecker HealthChecker
 }
 
-func NewDevicePlugin(resourceName string, devices []*pluginapi.Device) *DevicePlugin {
+func NewDevicePlugin(resourceName string, devices []*pluginapi.Device, opts ...Option) *DevicePlugin {
 	store := make(map[string]*pluginapi.Device, len(devices))
 	for _, d := range devices {
 		store[d.ID] = d
 	}
 
-	return &DevicePlugin{
-		ctx:          context.Background(),
-		devices:      store,
-		resourceName: resourceName,
-		socket:       fmt.Sprintf("tenstorrent-%s.sock", resourceName),
-		socketDir:    pluginapi.DevicePluginPath,
+	dp := &DevicePlugin{
+		ctx:           context.Background(),
+		devices:       store,
+		resourceName:  resourceName,
+		socket:        fmt.Sprintf("tenstorrent-%s.sock", resourceName),
+		socketDir:     pluginapi.DevicePluginPath,
+		healthChecker: &sysfsHealthChecker{},
 	}
+
+	for _, opt := range opts {
+		opt(dp)
+	}
+
+	return dp
 }
 
 // GetDevicePluginOptions returns options to be communicated with Device Manager.
@@ -94,8 +136,10 @@ func (dp *DevicePlugin) deviceSnapshot() []*pluginapi.Device {
 
 	out := make([]*pluginapi.Device, 0, len(dp.devices))
 	for _, d := range dp.devices {
-		copy := *d
-		out = append(out, &copy)
+		out = append(out, &pluginapi.Device{
+			ID:     d.ID,
+			Health: d.Health,
+		})
 	}
 	return out
 }
@@ -199,7 +243,7 @@ func (dp *DevicePlugin) RunStartupHealthChecks() {
 	defer dp.devicesMu.Unlock()
 
 	for id, dev := range dp.devices {
-		dev.Health = checkDeviceHealth(id)
+		dev.Health = dp.healthChecker.Check(id)
 		klog.Infof("Startup health check: device %s → %s", id, dev.Health)
 	}
 }
@@ -279,10 +323,10 @@ func (dp *DevicePlugin) waitForServerReady(timeout time.Duration) error {
 }
 
 func (dp *DevicePlugin) Register(kubeletEndpoint string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	conn, err := dp.dial(ctx)
+	conn, err := dp.dial(ctx, kubeletEndpoint)
 	if err != nil {
 		return err
 	}
@@ -308,10 +352,10 @@ func (dp *DevicePlugin) Register(kubeletEndpoint string) error {
 	return nil
 }
 
-// dial is a helper function that establishes gRPC communication with the kubelet
-func (dp *DevicePlugin) dial(ctx context.Context) (*grpc.ClientConn, error) {
-	kubeletSocketEndpoint := fmt.Sprintf("unix://%s", pluginapi.KubeletSocket)
-	
+// dial establishes gRPC communication with the kubelet at the given socket path.
+func (dp *DevicePlugin) dial(ctx context.Context, endpoint string) (*grpc.ClientConn, error) {
+	kubeletSocketEndpoint := fmt.Sprintf("unix://%s", endpoint)
+
 	klog.Infof("Dialing kubelet socket: %s", kubeletSocketEndpoint)
 
 	conn, err := grpc.NewClient(

@@ -39,7 +39,12 @@ func TestDirectoryCheck_FailsForFile(t *testing.T) {
 // --- SocketCheck ---
 
 func TestSocketCheck_PassesForSocket(t *testing.T) {
-	sockPath := filepath.Join(t.TempDir(), "test.sock")
+	dir, err := os.MkdirTemp("/tmp", "tt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sockPath := filepath.Join(dir, "t.sock")
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		t.Fatal(err)

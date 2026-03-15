@@ -83,12 +83,42 @@ sequenceDiagram
 
 ## Testing
 
-Running tests with local `go` install:
-`go test ./...`
+No real hardware is required. All tests use mocks and temporary Unix sockets.
+Tests assert only against the public API (exported types and gRPC responses), never against unexported internals.
+
+### Unit tests
+
+Unit tests live in `*_test.go` files alongside the source they cover (e.g. `internal/plugin/device_plugin_test.go`). They test business logic in isolation: device discovery, allocation, health checks, registration, and error handling.
+
+```sh
+go test ./internal/...
+```
+
+### Integration tests
+
+Integration tests live in the `integration/` directory and exercise the plugin as a whole over gRPC (server, ListAndWatch, Allocate, Register). They use `testify/suite` for structured setup/teardown and include concurrency tests.
+
+```sh
+go test ./integration/...
+```
+
+To skip integration tests in quick CI runs:
+
+```sh
+go test -short ./...
+```
+
+### All tests (with race detector)
+
+```sh
+go test -race ./...
+```
 
 Running the tests within a docker container:
-`docker run --rm -v "$(pwd)":/src -w /src golang:1.25-bookworm go test ./...`
 
+```sh
+docker run --rm -v "$(pwd)":/src -w /src golang:1.25-bookworm go test -race ./...
+```
 
 ### Testing in (Kind) Kubernetes
 ```
