@@ -1,0 +1,151 @@
+---
+description: Go testing standards for the Kubernetes device plugin — unit tests, integration tests, mocking, and test organization
+globs: **/*_test.go,**/integration/**
+alwaysApply: false
+---
+
+# Go Testing Standards
+
+All tests must run **without real hardware**. Mock every device and external
+dependency so tests are fast and reproducible in CI.
+
+---
+
+## Test File Conventions
+
+- Name test files `*_test.go` alongside the source file they cover.
+- Test functions: `func TestXxx(t *testing.T)` — `Xxx` must not start with a lowercase letter.
+- Use `t.Run("subcase", func(t *testing.T) { ... })` for table-driven subtests.
+- Use `t.Helper()` in shared test helpers so failures report the caller's location.
+- Use `t.Cleanup(func())` for teardown instead of `defer` — it runs after subtests complete.
+- Use `t.TempDir()` for temporary files and socket paths (auto-cleaned, avoids path conflicts).
+
+---
+
+## Assertions — `testify`
+
+- Use `assert` for non-fatal checks: `assert.Equal(t, expected, actual)`, `assert.NoError`, `assert.Nil`.
+- Use `require` for preconditions that must pass before continuing — it calls `t.FailNow()`.
+- Never call `require` from a goroutine other than the one running the test.
+- Call `mockObj.AssertExpectations(t)` at the end of every test that sets mock expectations.
+
+---
+
+## Mocking
+
+### `testify/mock`
+
+Use for simulating device states and health check responses:
+
+```go
+type MockHealthChecker struct {
+    mock.Mock
+}
+
+func (m *MockHealthChecker) Check(id string) bool {
+    args := m.Called(id)
+    return args.Bool(0)
+}
+
+// In test:
+hc := new(MockHealthChecker)
+hc.On("Check", "dev-0").Return(true)
+// ... exercise code ...
+hc.AssertExpectations(t)
+```
+
+- Use `mock.Anything` as a wildcard argument matcher.
+- Use `.Unset()` to replace an expectation mid-test.
+
+### `gomock` (uber-go/mock)
+
+Use when generating mocks from interfaces:
+
+- Generate: `mockgen -source=interfaces.go -destination=mocks/mock_interfaces.go`
+- Create controller: `ctrl := gomock.NewController(t)`
+- Set expectations: `mockObj.EXPECT().Method(gomock.Any()).Return(value).AnyTimes()`
+- Place generated mocks in a `mocks/` sub-package.
+- Add `//go:generate mockgen` comments for automated regeneration.
+
+---
+
+## Design for Testability
+
+- Abstract hardware interaction behind interfaces (`DeviceManager`, `HealthChecker`).
+- Keep core logic (allocation, health transitions) separate from I/O and gRPC plumbing.
+- Inject dependencies via constructor parameters, not globals.
+
+---
+
+## Unit Tests
+
+Focus: business logic in isolation — device management, allocation, health status.
+
+| What to test                | Verify                                                        |
+|-----------------------------|---------------------------------------------------------------|
+| Device discovery            | Plugin initializes with expected fake devices from mocks      |
+| Allocation logic            | Devices assigned uniquely, released correctly, no double-alloc|
+| Health checks               | State transitions healthy → unhealthy → healthy               |
+| Registration handling       | Correct gRPC interaction flow and state changes               |
+| Error / edge cases          | Unresponsive device, unavailable alloc, plugin restart        |
+
+---
+
+## Integration Tests
+
+Focus: plugin as a whole — gRPC server, registration, `ListAndWatch`, `Allocate`.
+
+### gRPC / Socket Setup
+
+- Create a temporary Unix socket with `net.Listen("unix", filepath.Join(t.TempDir(), "test.sock"))`.
+- Start the plugin gRPC server on that socket.
+- Connect a gRPC test client to exercise `Register`, `ListAndWatch`, `Allocate`.
+- Always `defer listener.Close()` and clean up sockets after each test.
+- Set deadlines on connections to prevent tests from hanging.
+
+### Test Suite Organization
+
+- Use `testify/suite` with `suite.Suite` embedding for shared setup/teardown:
+
+```go
+type PluginIntegrationSuite struct {
+    suite.Suite
+    server *grpc.Server
+    conn   *grpc.ClientConn
+    tmpDir string
+}
+
+func (s *PluginIntegrationSuite) SetupTest()    { /* start server */ }
+func (s *PluginIntegrationSuite) TeardownTest() { /* stop server, clean up */ }
+
+func TestPluginIntegration(t *testing.T) {
+    suite.Run(t, new(PluginIntegrationSuite))
+}
+```
+
+### Concurrency
+
+- Exercise allocation under concurrent requests to verify thread safety.
+- Use `t.Parallel()` for independent subtests.
+- Test with `sync.WaitGroup` or goroutine fan-out to surface race conditions.
+- Run tests with `-race` flag in CI.
+
+### Integration Test Cases
+
+| What to test                | Verify                                                        |
+|-----------------------------|---------------------------------------------------------------|
+| gRPC API endpoints          | Plugin serves all protocol endpoints correctly                |
+| Device lifecycle events     | Add/remove/health-flip updates via `ListAndWatch` stream      |
+| Multi-pod allocation        | Correct distribution, exhausted-resource handling             |
+| Health change propagation   | Unhealthy devices excluded, kubelet mock notified             |
+| Error recovery              | Connection drops, unexpected input, consistent state recovery |
+
+---
+
+## Test Organization & CI
+
+- Unit tests: `*_test.go` files adjacent to source code.
+- Integration tests: in an `integration/` directory or build-tagged files, run separately in CI.
+- CI command: `go test ./...` to execute all tests.
+- Use `-short` flag and `testing.Short()` to skip long integration tests in quick CI runs.
+- Mock all hardware and external dependencies — no real devices in CI.
